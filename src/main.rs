@@ -1,14 +1,17 @@
 use clap::{ Parser, ValueEnum };
 use termimad::crossterm::style::{Attributes, Color};
+use indicatif::{ ProgressBar, ProgressStyle };
 use std::collections::HashMap;
 use std::env;
 use termimad::{ Alignment, CompoundStyle, LineStyle, ListItemsIndentationMode, MadSkin, ScrollBarStyle, StyledChar, TableBorderChars };
 use std::fs;
 use std::path::{ Path, PathBuf };
-use git2::Repository;
+use git2::{ Repository, FetchOptions, RemoteCallbacks };
 use serde::{ Deserialize, Serialize };
 use anyhow::{ Result, anyhow };
 use path_absolutize::Absolutize;
+use std::time::Duration;
+use std::sync::{ Arc, Mutex };
 
 static NAME: &'static str = env!("CARGO_PKG_NAME");
 static VERSION: &'static str = env!("CARGO_PKG_VERSION");
@@ -142,12 +145,56 @@ fn show_page(page: &str, skin: &MadSkin, _args: &Args) {
 
 fn sync_git_repos(git_urls: &Vec<String>, local_dir: &Path) -> Result<()> {
     fs::create_dir_all(local_dir)?;
+
+    let spinner = ProgressBar::new_spinner();
+    spinner.set_message("Cloning repository...");
+    spinner.enable_steady_tick(Duration::from_millis(100));
+    spinner.set_style(ProgressStyle::default_spinner()
+        .template("{spinner:.green} {msg}")
+        .unwrap());
+
+    let progress = Arc::new(Mutex::new(ProgressBar::new(0)));
+
+    let mut callbacks = RemoteCallbacks::new();
+    let progress_clone = progress.clone();
+    callbacks.transfer_progress(move |stats| {
+        let pb = progress_clone.lock().unwrap();
+
+        if pb.length().is_none() {
+            pb.set_length(stats.total_objects() as u64);
+            pb.set_style(ProgressStyle::default_bar()
+                .template("[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} objects ({eta})")
+                .unwrap()
+                .progress_chars("=> "));
+            pb.set_message("Downloading objects");
+        }
+
+        pb.set_position(stats.received_objects() as u64);
+        true
+    });
+
+    let mut fetch_options = FetchOptions::new();
+    fetch_options.remote_callbacks(callbacks);
+
+
+    spinner.set_message("Starting download...");
+
     for git_url in git_urls {
-        match Repository::clone(&git_url, "path") {
+        let repo_name = git_url
+            .rsplit('/')
+            .next().ok_or(anyhow!("Malformed repo url"))?
+            .strip_suffix(".git")
+            .unwrap_or_else(|| git_url.rsplit('/').next()
+            .expect("next() was checked above"));
+
+        let clone_dir = local_dir.join(repo_name);
+
+        match Repository::clone(&git_url, &clone_dir) {
             Ok(repo) => println!("successfully cloned {}", repo.path().display()),
             Err(e) => println!("failed to clone: {e}"),
         }
     }
+
     Ok(())
 }
 
@@ -166,7 +213,7 @@ where
         }
     }).peekable();
 
-    if pages.peek().is_some() {
+    if pages.peek().is_none() {
         format!("No result found for: {page_name}")
     }
     else {

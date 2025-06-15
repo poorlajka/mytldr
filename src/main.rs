@@ -1,6 +1,6 @@
 use clap::{ Parser, ValueEnum };
 use termimad::crossterm::style::{Attributes, Color};
-use indicatif::{ ProgressBar, ProgressStyle };
+use indicatif::{ ProgressBar, ProgressStyle, MultiProgress };
 use std::collections::HashMap;
 use std::env;
 use termimad::{ Alignment, CompoundStyle, LineStyle, ListItemsIndentationMode, MadSkin, ScrollBarStyle, StyledChar, TableBorderChars };
@@ -12,6 +12,9 @@ use anyhow::{ Result, anyhow };
 use path_absolutize::Absolutize;
 use std::time::Duration;
 use std::sync::{ Arc, Mutex };
+use std::future;
+use tokio::task;
+use futures::future::join_all;
 
 static NAME: &'static str = env!("CARGO_PKG_NAME");
 static VERSION: &'static str = env!("CARGO_PKG_VERSION");
@@ -145,40 +148,103 @@ fn show_page(page: &str, skin: &MadSkin, _args: &Args) {
 
 fn sync_git_repos(git_urls: &Vec<String>, local_dir: &Path) -> Result<()> {
     fs::create_dir_all(local_dir)?;
+    println!("hello");
 
-    let spinner = ProgressBar::new_spinner();
-    spinner.set_message("Cloning repository...");
-    spinner.enable_steady_tick(Duration::from_millis(100));
-    spinner.set_style(ProgressStyle::default_spinner()
-        .template("{spinner:.green} {msg}")
-        .unwrap());
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
 
-    let progress = Arc::new(Mutex::new(ProgressBar::new(0)));
 
-    let mut callbacks = RemoteCallbacks::new();
-    let progress_clone = progress.clone();
-    callbacks.transfer_progress(move |stats| {
-        let pb = progress_clone.lock().unwrap();
+    rt.block_on(async {
 
-        if pb.length().is_none() {
-            pb.set_length(stats.total_objects() as u64);
-            pb.set_style(ProgressStyle::default_bar()
-                .template("[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} objects ({eta})")
-                .unwrap()
-                .progress_chars("=> "));
-            pb.set_message("Downloading objects");
+        let local_dir = local_dir.to_path_buf();
+        let multi_pb = Arc::new(MultiProgress::new());
+        let mut handles = vec![];
+
+        for url in git_urls.clone() {
+            let multi_pb = Arc::clone(&multi_pb);
+            let local_dir = local_dir.clone();
+
+            let handle = task::spawn(async move {
+                let repo_name = url
+                    .split('/')
+                    .last()
+                    .unwrap_or("unknown")
+                    .trim_end_matches(".git");
+
+                let dest_path = local_dir.join(repo_name);
+                let _ = std::fs::create_dir_all(&dest_path);
+
+                let spinner = multi_pb.add(ProgressBar::new_spinner());
+                spinner.set_message(format!("Cloning {repo_name}..."));
+                spinner.enable_steady_tick(Duration::from_millis(100));
+                spinner.set_style(
+                    ProgressStyle::default_spinner()
+                        .template("{spinner:.green} {msg}")
+                        .unwrap(),
+                );
+
+                let pb = multi_pb.add(ProgressBar::new(0));
+                let progress = Arc::new(Mutex::new(pb));
+
+                let result = task::spawn_blocking({
+                    let url = url.clone();
+                    let dest_path = dest_path.clone();
+                    let progress = Arc::clone(&progress);
+
+                    move || {
+                        let mut callbacks = RemoteCallbacks::new();
+                        callbacks.transfer_progress(move |stats| {
+                            let pb = progress.lock().unwrap();
+                            if pb.length().is_none() {
+                                pb.set_length(stats.total_objects() as u64);
+                                pb.set_style(
+                                    ProgressStyle::default_bar()
+                                        .template(
+                                            "[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} objects",
+                                        )
+                                        .unwrap()
+                                        .progress_chars("=> "),
+                                );
+                            }
+                            pb.set_position(stats.received_objects() as u64);
+                            true
+                        });
+
+                        let mut fetch_options = FetchOptions::new();
+                        fetch_options.remote_callbacks(callbacks);
+
+                        let mut builder = git2::build::RepoBuilder::new();
+                        builder.fetch_options(fetch_options);
+
+                        builder.clone(&url, &dest_path)
+                    }
+                })
+                .await;
+
+                match result {
+                    Ok(Ok(_repo)) => {
+                        spinner.finish_with_message(format!("✅ Cloned {repo_name}"));
+                        progress.lock().unwrap().finish_with_message(format!("Done with {repo_name}"));
+                    }
+                    Ok(Err(e)) => {
+                        spinner.finish_with_message(format!("❌ Failed to clone {repo_name}: {e}"));
+                    }
+                    Err(e) => {
+                        spinner.finish_with_message(format!("❌ Task failed: {e}"));
+                    }
+                }
+            });
+
+            handles.push(handle);
         }
 
-        pb.set_position(stats.received_objects() as u64);
-        true
+        // Wait for all clones to finish
+        futures::future::join_all(handles).await;
     });
 
-    let mut fetch_options = FetchOptions::new();
-    fetch_options.remote_callbacks(callbacks);
-
-
-    spinner.set_message("Starting download...");
-
+    /* 
     for git_url in git_urls {
         let repo_name = git_url
             .rsplit('/')
@@ -194,6 +260,7 @@ fn sync_git_repos(git_urls: &Vec<String>, local_dir: &Path) -> Result<()> {
             Err(e) => println!("failed to clone: {e}"),
         }
     }
+    */
 
     Ok(())
 }

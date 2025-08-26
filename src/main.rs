@@ -1,20 +1,22 @@
 use clap::{ Parser, ValueEnum };
+use std::thread;
 use termimad::crossterm::style::{Attributes, Color};
 use indicatif::{ ProgressBar, ProgressStyle, MultiProgress };
 use std::collections::HashMap;
 use std::env;
 use termimad::{ Alignment, CompoundStyle, LineStyle, ListItemsIndentationMode, MadSkin, ScrollBarStyle, StyledChar, TableBorderChars };
 use std::fs;
+use regex::Regex;
 use std::path::{ Path, PathBuf };
 use git2::{ Repository, FetchOptions, RemoteCallbacks };
+use std::process::{Command, Stdio};
 use serde::{ Deserialize, Serialize };
 use anyhow::{ Result, anyhow };
 use path_absolutize::Absolutize;
 use std::time::Duration;
 use std::sync::{ Arc, Mutex };
-use std::future;
-use tokio::task;
-use futures::future::join_all;
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use std::io::{self, BufRead, BufReader, Read, stdout, Write};
 
 static NAME: &'static str = env!("CARGO_PKG_NAME");
 static VERSION: &'static str = env!("CARGO_PKG_VERSION");
@@ -41,7 +43,7 @@ struct Config {
 
 #[derive(Debug, Deserialize, Serialize)]
 struct PageDb {
-    git_repos: Vec<String>,
+    git_repos: Vec<Vec<String>>,
     git_download_dir: String,
     local_dirs: Vec<String>,
 }
@@ -99,6 +101,7 @@ OPTIONS:
     after_help = "\u{200B}",
     disable_help_flag = true,
     disable_version_flag = true,
+    arg_required_else_help = true,
 )]
 struct Args {
     /// Show documentation 
@@ -146,121 +149,166 @@ fn show_page(page: &str, skin: &MadSkin, _args: &Args) {
     println!("");
 }
 
-fn sync_git_repos(git_urls: &Vec<String>, local_dir: &Path) -> Result<()> {
-    fs::create_dir_all(local_dir)?;
-    println!("hello");
+fn sync_git_repos(git_urls: &Vec<Vec<String>>, parent_dir: &Path) -> Result<()> {
+    fs::create_dir_all(parent_dir)?;
+    let multi_progress = MultiProgress::new();
+    multi_progress.println("Cloning online page repos from git")?;
+    let mut threads = vec![];
+    for entry in git_urls.iter().rev() {
+        let url = &entry[0];
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .unwrap();
+        let repo_name = url
+            .split('/')
+            .last()
+            .unwrap_or("unknown")
+            .trim_end_matches(".git");
 
-
-    rt.block_on(async {
-
-        let local_dir = local_dir.to_path_buf();
-        let multi_pb = Arc::new(MultiProgress::new());
-        let mut handles = vec![];
-
-        for url in git_urls.clone() {
-            let multi_pb = Arc::clone(&multi_pb);
-            let local_dir = local_dir.clone();
-
-            let handle = task::spawn(async move {
-                let repo_name = url
-                    .split('/')
-                    .last()
-                    .unwrap_or("unknown")
-                    .trim_end_matches(".git");
-
-                let dest_path = local_dir.join(repo_name);
-                let _ = std::fs::create_dir_all(&dest_path);
-
-                let spinner = multi_pb.add(ProgressBar::new_spinner());
-                spinner.set_message(format!("Cloning {repo_name}..."));
-                spinner.enable_steady_tick(Duration::from_millis(100));
-                spinner.set_style(
-                    ProgressStyle::default_spinner()
-                        .template("{spinner:.green} {msg}")
-                        .unwrap(),
-                );
-
-                let pb = multi_pb.add(ProgressBar::new(0));
-                let progress = Arc::new(Mutex::new(pb));
-
-                let result = task::spawn_blocking({
-                    let url = url.clone();
-                    let dest_path = dest_path.clone();
-                    let progress = Arc::clone(&progress);
-
-                    move || {
-                        let mut callbacks = RemoteCallbacks::new();
-                        callbacks.transfer_progress(move |stats| {
-                            let pb = progress.lock().unwrap();
-                            if pb.length().is_none() {
-                                pb.set_length(stats.total_objects() as u64);
-                                pb.set_style(
-                                    ProgressStyle::default_bar()
-                                        .template(
-                                            "[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} objects",
-                                        )
-                                        .unwrap()
-                                        .progress_chars("=> "),
-                                );
-                            }
-                            pb.set_position(stats.received_objects() as u64);
-                            true
-                        });
-
-                        let mut fetch_options = FetchOptions::new();
-                        fetch_options.remote_callbacks(callbacks);
-
-                        let mut builder = git2::build::RepoBuilder::new();
-                        builder.fetch_options(fetch_options);
-
-                        builder.clone(&url, &dest_path)
-                    }
-                })
-                .await;
-
-                match result {
-                    Ok(Ok(_repo)) => {
-                        spinner.finish_with_message(format!("✅ Cloned {repo_name}"));
-                        progress.lock().unwrap().finish_with_message(format!("Done with {repo_name}"));
-                    }
-                    Ok(Err(e)) => {
-                        spinner.finish_with_message(format!("❌ Failed to clone {repo_name}: {e}"));
-                    }
-                    Err(e) => {
-                        spinner.finish_with_message(format!("❌ Task failed: {e}"));
-                    }
-                }
-            });
-
-            handles.push(handle);
+        let target_dir = parent_dir.join(repo_name);
+        if target_dir.exists() {
+            fs::remove_dir_all(&target_dir).unwrap();
         }
 
-        // Wait for all clones to finish
-        futures::future::join_all(handles).await;
-    });
+        let progress_bar = multi_progress.add(ProgressBar::new_spinner());
+        let url_clone = url.clone();
+        threads.push(thread::spawn(move || {
+            thread::sleep(Duration::from_millis(500));
+            clone_repo(&url_clone, &target_dir, &progress_bar.clone()).unwrap();
+        }));
+    }
+    for thread in threads {
+        let _ = thread.join();
+    }
 
-    /* 
-    for git_url in git_urls {
-        let repo_name = git_url
-            .rsplit('/')
-            .next().ok_or(anyhow!("Malformed repo url"))?
-            .strip_suffix(".git")
-            .unwrap_or_else(|| git_url.rsplit('/').next()
-            .expect("next() was checked above"));
+    Ok(())
+}
 
-        let clone_dir = local_dir.join(repo_name);
+enum CloneState {
+    ReceivingObjects,
+    ResolvingDeltas,
+    UpdatingFiles,
+    Finished,
+}
 
-        match Repository::clone(&git_url, &clone_dir) {
-            Ok(repo) => println!("successfully cloned {}", repo.path().display()),
-            Err(e) => println!("failed to clone: {e}"),
+impl CloneState {
+    fn new() -> Self {
+        CloneState::ReceivingObjects
+    }
+
+    fn next(&self) -> Self {
+        match self {
+            CloneState::ReceivingObjects => CloneState::ResolvingDeltas,
+            CloneState::ResolvingDeltas => CloneState::UpdatingFiles,
+            CloneState::UpdatingFiles => CloneState::Finished,
+            CloneState::Finished => CloneState::Finished,
         }
     }
+
+    fn text(&self) -> String {
+        match self {
+            CloneState::ReceivingObjects => String::from("Receiving objects"),
+            CloneState::ResolvingDeltas => String::from("Resolving deltas"),
+            CloneState::UpdatingFiles => String::from("Updating files"),
+            CloneState::Finished => String::from("Finished"),
+        }
+    }
+
+    fn style(&self) -> ProgressStyle {
+        let template = match self {
+            CloneState::ReceivingObjects => "[{bar:40.cyan/blue}] {pos}/{len} {msg}",
+            CloneState::ResolvingDeltas => "[{bar:40.yellow/cyan}] {pos}/{len} {msg}",
+            CloneState::UpdatingFiles => "[{bar:40.green/yellow}] {pos}/{len} {msg}",
+            CloneState::Finished => "[{bar:40.green/yellow}] {pos}/{len} {msg}",
+        };
+
+        let progress_chars = match self {
+            CloneState::ReceivingObjects => "##-",
+            CloneState::ResolvingDeltas => "=>#",
+            CloneState::UpdatingFiles => "->=",
+            CloneState::Finished => "->=",
+        };
+
+        ProgressStyle::default_bar()
+            .template(template)
+            .unwrap()
+            .progress_chars(progress_chars)
+    }
+}
+
+fn clone_repo(url: &str, dest: &Path, pb: &ProgressBar) -> anyhow::Result<()> {
+    /*
+        It would have been less hacky to use libgit2 for this but it was 10-100x slower 
+        which made cloning larger repos such as tldr really tedious imo.
+        So instead I opted to use the native git binary and manually parse the progress 
+        output with some regex to drive indicatif progress bars.
+
+        Needed to do some fiddling with the output from git since it iterates the progress
+        report using carriage returns. Solution based on: https://askubuntu.com/a/990280 
     */
+
+    let mut cmd = Command::new("git");
+    cmd.arg("clone")
+        .arg("--progress")
+        .arg(url)
+        .arg(dest)
+        .stderr(Stdio::piped());
+
+    let mut child = cmd.spawn()?;
+    let mut stderr = child.stderr.take().expect("Failed to capture stderr");
+    let mut reader = BufReader::new(stderr);
+
+
+    pb.enable_steady_tick(Duration::from_millis(100));
+    let repo_name = dest.components().last().expect("This cannot be empty").as_os_str();
+    pb.set_message(format!("Beginning cloning for {:?}", repo_name));
+
+    let mut buffer = Vec::new();
+    let mut temp = [0u8; 1024];
+    let mut clone_state = CloneState::new();
+
+    while let Ok(n) = reader.read(&mut temp) {
+        if n == 0 { break; }
+        buffer.extend_from_slice(&temp[..n]);
+        // Replace \r with \n
+        while let Some(pos) = buffer.iter().position(|&b| b == b'\r') {
+            buffer[pos] = b'\n';
+        }
+
+        // Process complete lines
+        while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
+            let line = String::from_utf8_lossy(&buffer[..pos]).to_string();
+            buffer.drain(..=pos);
+
+            let pattern = &format!(r"{}:\s*(?:\d+%)?\s*\((\d+)/(\d+)\)", clone_state.text());
+
+            let progress_regex = Regex::new(pattern).unwrap();
+
+            let mut last_received = 0;
+            if let Some(caps) = progress_regex.captures(&line) {
+                let received: u64 = caps[1].parse().unwrap_or(0);
+                let total: u64 = caps[2].parse().unwrap_or(0);
+                pb.set_length(total);
+                pb.set_position(received);
+                if received > last_received {
+                    pb.set_style(clone_state.style());
+                    pb.set_message(format!("Cloning {:?}: {}", repo_name, clone_state.text()));
+                }
+
+                if received == total {
+                    clone_state = clone_state.next();
+                    last_received = 0;
+                }
+            }
+        }
+    }
+
+    let status = child.wait()?;
+    if status.success() {
+        pb.set_style(clone_state.style());
+        pb.finish_with_message(format!("✅ Finished cloning {:?}", repo_name));
+    } else {
+        pb.set_style(clone_state.style());
+        pb.finish_with_message(format!("❌ Failed cloning {:?}", repo_name));
+    }
 
     Ok(())
 }
@@ -410,10 +458,12 @@ fn main() -> Result<()> {
         let skin = get_skin(&config.style);
         show_page(&page, &skin, &args);
     }
+    /* 
     else {
         println!("\nPlease enter the name of the page[s] you wish to see");
         println!("Run \"pager --help\" to see usage\n");
     }
+    */
 
     Ok(())
 }

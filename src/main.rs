@@ -383,6 +383,28 @@ fn get_skin(_style: &Style) -> MadSkin {
     }
 }
 
+fn get_online_hashmap(git_repos: &Vec<Vec<String>>) -> HashMap<String, String> {
+    let online_hashmap: HashMap<_, _> = git_repos
+        .iter()
+        .filter_map(|x| {
+            let repo_name = x[0]
+                .split('/')
+                .last()
+                .unwrap_or("unknown")
+                .trim_end_matches(".git");
+
+            if x.len() == 2 {
+                Some((String::from(repo_name), x[1].clone()))
+            }
+            else {
+                None
+            }
+        })
+        .collect();
+
+    online_hashmap
+}
+
 fn main() -> Result<()> {
     /* 
        Ensure config exists, if not copy the default config 
@@ -419,6 +441,7 @@ fn main() -> Result<()> {
         local_dirs,
     } = &config.page_db;
 
+
     let config_dir = config_path
         .parent()
         .ok_or(anyhow!("'Aint no way, aint no fucking way' -Future"))?;
@@ -439,12 +462,42 @@ fn main() -> Result<()> {
     /* 
         Lookup and show page 
     */
+    let online_hashmap = get_online_hashmap(repos);
     if let Some(page_name) = &args.page_name {
         let db_iter = fs::read_dir(download_dir)?
-            .filter_map(|entry| {
+            .flat_map(|entry| {
                 match entry {
-                    Ok(e) if e.path().is_dir() => Some(e.path()),
-                    _ => None,
+                    Ok(e) => {
+                        if e.path().is_dir() {
+                            let file_name = e.file_name();
+                            let dir_name = file_name.to_str().unwrap_or("");
+                            let mut path = e.path();
+                            if let Some(subdir) = online_hashmap.get(dir_name) {
+                                for c in subdir.split("/") {
+                                    if c == "*" {
+                                        // This is some ugly ass fuckshit
+                                        let mut paths = Vec::new();
+                                        for entry in fs::read_dir(path).unwrap() {
+                                            let e = entry.unwrap();
+                                            let metadata = e.metadata().unwrap();
+                                            if metadata.is_dir() {
+                                                paths.push(e.path());
+                                            }
+                                        }
+                                        return paths;
+                                    }
+                                    else {
+                                        path = path.join(c);
+                                    }
+                                }
+                            }
+                            vec![path]
+                        }
+                        else {
+                            Vec::new()
+                        }
+                    },
+                    _ => Vec::new(),
                 }
             }).chain(local_dirs
                 .iter()

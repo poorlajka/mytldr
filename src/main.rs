@@ -1,4 +1,8 @@
+mod md_render;
+
+
 use clap::{ Parser, ValueEnum };
+use termimad::minimad::parser::parse;
 use std::thread;
 use termimad::crossterm::style::{Attributes, Color};
 use indicatif::{ ProgressBar, ProgressStyle, MultiProgress };
@@ -8,32 +12,30 @@ use termimad::{ Alignment, CompoundStyle, LineStyle, ListItemsIndentationMode, M
 use std::fs;
 use regex::Regex;
 use std::path::{ Path, PathBuf };
-use git2::{ Repository, FetchOptions, RemoteCallbacks };
 use std::process::{Command, Stdio};
 use serde::{ Deserialize, Serialize };
 use anyhow::{ Result, anyhow };
 use path_absolutize::Absolutize;
 use std::time::Duration;
 use std::sync::{ Arc, Mutex };
-use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::io::{self, BufRead, BufReader, Read, stdout, Write};
 
 static NAME: &'static str = env!("CARGO_PKG_NAME");
 static VERSION: &'static str = env!("CARGO_PKG_VERSION");
+
 static ABOUT_MSG: &'static str = r#"
 
-Art by Hayley Jane Wakenshaw
 
-        ,-""""""-.
-     /\j__/\  (  \`--.
-     \`@_@'/  _)  >--.`.     Pager: A personal 
-    _{.:Y:_}_{{_,'    ) )    page/note-viewer
-   {_}`-^{_} ```     (_/
-
+          /\  /\
+          \ \_\ \
+          | O .O]     Pager: A personal
+        _|     -      page/note-viewer
+      _/       |\ 
+    /   _=_   |
+   +___/ ||  ||
 "#;
 
 type MarkdownPage = String;
-
 #[derive(Debug, Deserialize, Serialize)]
 struct Config {
     page_db: PageDb,
@@ -50,6 +52,29 @@ struct PageDb {
 
 #[derive(Debug, Deserialize, Serialize)]
 struct Style {
+    paragraph: StyleColor,
+    bullet: StyleColor,
+    headers: StyleColor,
+    bold: StyleColor,
+    italic: StyleColor,
+    strikeout: StyleColor,
+    inline_code: StyleColor,
+    code_block: StyleColor,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct StyleColor {
+    fg: String,
+    bg: String,
+}
+
+impl StyleColor {
+    fn default() -> Self {
+        Self {
+            fg: String::from("#ffffff"),
+            bg: String::from("#000000"),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -66,7 +91,14 @@ impl Default for Config {
                 local_dirs: Vec::new(),
             },
             style: Style {
-
+                paragraph: StyleColor::default(),
+                bullet: StyleColor::default(),
+                headers: StyleColor::default(),
+                bold: StyleColor::default(),
+                italic: StyleColor::default(),
+                strikeout: StyleColor::default(),
+                inline_code: StyleColor::default(),
+                code_block: StyleColor::default(),
             },
             default_flags: DefaultFlags {
 
@@ -145,8 +177,63 @@ struct Args {
 }
 
 fn show_page(page: &str, skin: &MadSkin, _args: &Args) {
+    let mut md_renderer = md_render::MdRenderer::new();
+    let _ = md_renderer.render_md(page);
+    
+    /*
     skin.print_text(page);
     println!("");
+     */
+}
+
+fn parse_color(s: &str) -> Option<Color> {
+    let s = s.trim();
+    //println!("{}", s);
+
+    // Try hex format: "#RRGGBB"
+    if let Some(hex) = s.strip_prefix('#') {
+        if hex.len() == 6 {
+            let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+            let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+            let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+            return Some(Color::Rgb { r, g, b });
+        }
+    }
+
+    // Try rgb(...) format
+    if let Some(inner) = s.strip_prefix("rgb(").and_then(|s| s.strip_suffix(')')) {
+        let parts: Vec<_> = inner.split(',').map(str::trim).collect();
+        if parts.len() == 3 {
+            let r = parts[0].parse().ok()?;
+            let g = parts[1].parse().ok()?;
+            let b = parts[2].parse().ok()?;
+            return Some(Color::Rgb { r, g, b });
+        }
+    }
+
+    // Try available named colors
+    let named_color = match s.to_lowercase().as_str() {
+        "darkgrey" | "dark grey" => Some(Color::DarkGrey),
+        "black" => Some(Color::Black),
+        "green" => Some(Color::Green),
+        "red" => Some(Color::Red),
+        "darkred" | "dark red" => Some(Color::DarkRed),
+        "darkgreen" | "dark green" => Some(Color::DarkGreen),
+        "yellow" => Some(Color::Yellow),
+        "darkyellow" | "dark yellow" => Some(Color::DarkYellow),
+        "blue" => Some(Color::Blue),
+        "darkblue" | "dark blue" => Some(Color::DarkBlue),
+        "magenta" => Some(Color::Magenta),
+        "darkmagenta" | "dark magenta"=> Some(Color::DarkMagenta),
+        "cyan" => Some(Color::Cyan),
+        "darkcyan"  | "dark cyan"=> Some(Color::DarkCyan),
+        "white" => Some(Color::White),
+        "grey" => Some(Color::Grey),
+        _ => None,
+    };
+    //println!("{:?}", named_color);
+
+    named_color
 }
 
 fn sync_git_repos(git_urls: &Vec<Vec<String>>, parent_dir: &Path) -> Result<()> {
@@ -347,21 +434,45 @@ fn validate_config(_config: &Config) -> Vec<String> {
     Vec::new()
 }
 
-fn get_skin(_style: &Style) -> MadSkin {
+fn get_skin(style: &Style) -> MadSkin {
     let c = CompoundStyle::new(Some(Color::White), None, Attributes::none());
     let l = LineStyle::new(c.clone(), Alignment::Left);
     let s = StyledChar::nude('*');
     MadSkin {
-        paragraph: l.clone(),
-        bold: c.clone(),
-        italic: c.clone(),
-        strikeout: c.clone(),
-        inline_code: c.clone(),
-        code_block: l.clone(),
+        paragraph: LineStyle::new(CompoundStyle::new(
+            parse_color(&style.paragraph.fg), 
+            parse_color(&style.paragraph.bg), 
+            Attributes::none(),
+        ), Alignment::Left),
+        bold: CompoundStyle::new(
+            parse_color(&style.bold.fg), 
+            parse_color(&style.bold.bg), 
+            Attributes::none()
+        ),
+        italic: CompoundStyle::new(
+            parse_color(&style.italic.fg), 
+            parse_color(&style.italic.bg), 
+            Attributes::none()
+        ),
+        strikeout: CompoundStyle::new(
+            parse_color(&style.strikeout.fg), 
+            parse_color(&style.strikeout.bg), 
+            Attributes::none()
+        ),
+        inline_code: CompoundStyle::new(
+            parse_color(&style.inline_code.fg), 
+            parse_color(&style.inline_code.bg), 
+            Attributes::none()
+        ),
+        code_block: LineStyle::new(CompoundStyle::new(
+            parse_color(&style.code_block.fg), 
+            parse_color(&style.code_block.bg), 
+            Attributes::none(),
+        ), Alignment::Left),
+        bullet: s.clone(),
         headers: [l.clone(), l.clone() ,l.clone() ,l.clone() ,l.clone() ,l.clone() ,l.clone() ,l.clone()],
         scrollbar: ScrollBarStyle {track: s.clone(), thumb: s.clone()},
         table: l,
-        bullet: s.clone(),
         quote_mark: s.clone(),
         horizontal_rule: s.clone(),
         ellipsis: c,
@@ -414,9 +525,9 @@ fn main() -> Result<()> {
         .join(Path::new(".config/pager/config.toml"));
 
     if !config_path.exists() {
-        if let Some(parent) = config_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
+        let parent = config_path.parent().expect("This should be the user home dir");
+        fs::create_dir_all(parent)?;
+
         let toml_config = toml::to_string_pretty(&Config::default())?;
         fs::write(&config_path, &toml_config)?;
     }

@@ -1,13 +1,14 @@
 use pulldown_cmark::{ CodeBlockKind, CowStr, Event, Parser, Tag, TagEnd };
 use crossterm::{
-    style::{Attribute, Color, Print, ResetColor, SetForegroundColor, Stylize},
-    QueueableCommand,
+    execute, style::{Attribute, Color, Print, ResetColor, SetBackgroundColor, SetColors, SetForegroundColor, Stylize}, Command, QueueableCommand
 };
 use std::io::{self, stdout, Stdout, Write};
+use std::fmt;
 
 pub struct MdRenderer {
     out: Stdout,
     context_stack: Vec<Context>,
+    margin_left: String,
 }
 
 enum Context {
@@ -24,6 +25,7 @@ impl MdRenderer {
         Self {
             out: stdout(),
             context_stack: Vec::new(),
+            margin_left: String::from(""),
         }
     }
 
@@ -40,6 +42,7 @@ impl MdRenderer {
     }
 
     pub fn render_md(&mut self, md: &str) ->  io::Result<()> {
+        println!("");
 
         let md_parser = Parser::new(md);
         for event in md_parser {
@@ -67,11 +70,24 @@ impl MdRenderer {
 
         let context = match tag {
             Tag::Paragraph => Some(Context::Paragraph),
-            Tag::CodeBlock(_) => Some(Context::CodeBlock),
+            Tag::CodeBlock(_) => {
+                print!("{} ", self.margin_left);
+                Some(Context::CodeBlock)
+            },
             Tag::Heading { level, .. } => Some(Context::Heading(*level as u8)),
-            Tag::BlockQuote(_) => Some(Context::BlockQuotes),
-            Tag::List(starting_at) => Some(Context::List(*starting_at)),
-            Tag::Item => Some(Context::ListItem),
+            Tag::BlockQuote(_) => {
+                print!("|");
+                Some(Context::BlockQuotes)
+            }
+            Tag::List(starting_at) => {
+                println!("");
+                self.margin_left = String::from("    ");
+                Some(Context::List(*starting_at))
+            },
+            Tag::Item => {
+                print!("{}* ", self.margin_left);
+                Some(Context::ListItem)
+            },
             Tag::HtmlBlock
             | Tag::FootnoteDefinition(_)
             | Tag::DefinitionList 
@@ -100,12 +116,25 @@ impl MdRenderer {
 
         match tag_end {
             TagEnd::Paragraph => {},
-            TagEnd::Heading(level) => {},
-            TagEnd::BlockQuote(kind) => {},
-            TagEnd::CodeBlock => {}, 
+            TagEnd::Heading(level) => {
+                println!("");
+                println!("");
+            },
+            TagEnd::BlockQuote(kind) => {
+                println!("");
+                println!("");
+            },
+            TagEnd::CodeBlock => {
+                println!("");
+            }, 
             TagEnd::HtmlBlock => {},
-            TagEnd::List(starting_from) => {},
-            TagEnd::Item => {},
+            TagEnd::List(starting_from) => {
+                self.margin_left = String::from("");
+            },
+            TagEnd::Item => {
+                println!("");
+                println!("");
+            },
             TagEnd::FootnoteDefinition => {},
             TagEnd::DefinitionList => {},
             TagEnd::DefinitionListTitle => {},
@@ -128,10 +157,22 @@ impl MdRenderer {
     }
 
     fn render_text(&mut self, text: &str) -> io::Result<()> {
+        match self.peek_context() {
+           Some(Context::BlockQuotes) => {
+
+           } 
+            _ => {},
+        }
+        print!("{}", text);
         Ok(())
     }
     
     fn render_code(&mut self, code: &str) -> io::Result<()> {
+        let bg_code = self.set_text_bg_color(&format!(" {code} "), &Color::Grey);
+        let fg_code = self.set_text_fg_color(&bg_code, &Color::Black);
+        print!("     {}", fg_code);
+        //This will work
+        //if let None = self.peek_context()
         Ok(())
     }
 
@@ -140,10 +181,13 @@ impl MdRenderer {
     }
 
     fn render_soft_break(&mut self) -> io::Result<()> {
+        println!(" ");
+        
         Ok(())
     }
 
     fn render_hard_break(&mut self) -> io::Result<()> {
+        println!("");
         Ok(())
     }
 
@@ -151,8 +195,12 @@ impl MdRenderer {
         Ok(())
     }
 
-    fn set_term_colors(&mut self, fg: Option<&Color>, bg: Option<&Color>) -> io::Result<()> {
-        Ok(())
+    fn set_text_bg_color(&self, text: &str, bg: &Color) -> String {
+        text.on(*bg).to_string()
+    }
+
+    fn set_text_fg_color(&self, text: &str, fg: &Color) -> String {
+        text.with(*fg).to_string()
     }
 
     fn set_term_attribute(attribute: &Attribute) -> io::Result<()> {
